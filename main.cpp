@@ -4,13 +4,16 @@
 #endif
 #endif
 
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <vector>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <csignal>
+#include <atomic>
 
 #define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <iostream>
 #include <thread>
 #include <fstream>
@@ -27,9 +30,13 @@ using namespace std;
 #define FILE_TRANSFER_PORT 8082
 #define BUFFER_SIZE 1024
 
+const unsigned char AES_KEY_128[16] = {
+    'D','R','O','N','E','G','U','A','R','D','1','2','3','4','5','6'
+};
+
 string drone_name;
 int drone_port;
-bool running = true;
+atomic<bool> running = true;
 
 class Drone
 {
@@ -100,15 +107,56 @@ void rtrim(string &str)
     }
 }
 
-string xorEncryptDecrypt(const string &message, char key)
+void handleSignal(int)
 {
-    string result = message;
-    for (int i = 0; i < message.size(); i++)
-    {
-        result[i] = message[i] ^ key;
-    }
-    return result;
+    running = false;
+    
 }
+
+//AES helper functions
+vector<unsigned char> aesEncrypt(
+    const string &plaintext,
+    unsigned char *iv_out
+) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    RAND_bytes(iv_out, 16);
+
+    vector<unsigned char> ciphertext(plaintext.size() + 16);
+    int len, ciphertext_len;
+
+    EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, AES_KEY_128, iv_out);
+    EVP_EncryptUpdate(ctx, ciphertext.data(), &len,
+                      (unsigned char*)plaintext.data(), plaintext.size());
+    ciphertext_len = len;
+
+    EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len);
+    ciphertext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+    ciphertext.resize(ciphertext_len);
+    return ciphertext;
+}
+
+string aesDecrypt(
+    const unsigned char *ciphertext,
+    int ciphertext_len,
+    const unsigned char *iv
+) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    vector<unsigned char> plaintext(ciphertext_len);
+    int len, plaintext_len;
+
+    EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, AES_KEY_128, iv);
+    EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext, ciphertext_len);
+    plaintext_len = len;
+
+    EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len);
+    plaintext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+    return string((char*)plaintext.data(), plaintext_len);
+}
+
 
 // Function to send files to server
 void FileTransferClient() 
@@ -177,15 +225,28 @@ void FileTransferClient()
 
         if (bytesRead > 0)
         {
-            // Encrypt the chunk before sending
-            string encryptedChunk = xorEncryptDecrypt(string(buffer, bytesRead), 'K');
+            unsigned char iv[16];
 
-            // Send the encrypted chunk
-            if (send(client_fd, encryptedChunk.c_str(), encryptedChunk.size(), 0) == SOCKET_ERROR) 
-            {
-                cerr << "Error sending file: " << WSAGetLastError() << endl;
-                break;
-            }
+        // Encrypt chunk using AES
+        auto encryptedChunk = aesEncrypt(string(buffer, bytesRead), iv);
+
+        // Send IV first
+        if (send(client_fd, (char*)iv, 16, 0) == SOCKET_ERROR)
+        {
+            cerr << "Error sending IV: " << WSAGetLastError() << endl;
+            break;
+        }
+
+        // Send encrypted chunk
+        if (send(client_fd,
+                (char*)encryptedChunk.data(),
+                encryptedChunk.size(),
+                0) == SOCKET_ERROR)
+        {
+            cerr << "Error sending encrypted file chunk: "
+                << WSAGetLastError() << endl;
+            break;
+        }
         }
     }
 
@@ -260,7 +321,15 @@ void receiveControlCommands()
 
         // Check if there's data to receive
         if (activity > 0 && FD_ISSET(sockfd, &readfds))
-        {
+        {   
+            unsigned char iv[16];
+            int ivBytes = recvfrom(sockfd, (char*)iv, 16, 0,
+                                (struct sockaddr*)&serverAddr, &addrLen);
+            if (ivBytes != 16)
+            {
+                cerr << "Failed to receive IV for control command" << endl;
+                continue;
+            }
             // Receive control command from the server
             int n = recvfrom(sockfd, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&serverAddr, &addrLen);
             if (n == SOCKET_ERROR)
@@ -268,11 +337,27 @@ void receiveControlCommands()
                 cerr << "recvfrom failed: " << WSAGetLastError() << endl;
                 continue;
             }
-            buffer[n] = '\0';
 
-            // Decrypt the received control command
-            string encryptedMessage(buffer);
-            string command = xorEncryptDecrypt(encryptedMessage, 'K');
+            string decrypted = aesDecrypt((unsigned char*)buffer, n, iv);
+
+            //Split timestamp and command
+            size_t sep = decrypted.find('|');
+            if (sep == string::npos)
+            {
+                cerr << "Malformed control command" << endl;
+                continue;
+            }
+
+            time_t msgTime = stol(decrypted.substr(0, sep));
+            string command = decrypted.substr(sep + 1);
+
+            // Replay protection check (5 seconds window)
+            time_t now = time(nullptr);
+            if (labs(now - msgTime) > 5)
+            {
+                cerr << "Rejected replayed control command" << endl;
+                continue;
+            }
 
             // Output the received control command
             cout << "Received Control Command: " << command << endl;
@@ -351,27 +436,44 @@ void sendTelemetryData()
     }
     
     // Send initial connection message with drone name
-    string td = "1 " + drone_name;
-    string ed = xorEncryptDecrypt(td, 'K');
-    send(clientSocket, ed.c_str(), ed.size(), 0);
+    string td = "REGISTER " + drone_name + " " + to_string(drone_port);
+
+    unsigned char iv[16];
+    auto encrypted = aesEncrypt(td, iv);
+
+    send(clientSocket, (char*)iv, 16, 0);
+    send(clientSocket, (char*)encrypted.data(), encrypted.size(), 0);
+
     cout << "Established Connection With Server: " << td << endl;
-    
+
     this_thread::sleep_for(chrono::seconds(2));
 
     while (running)
     {
         string telemetryData = drone.getTelemetryData();
-        string encryptedData = xorEncryptDecrypt(telemetryData, 'K');
-        
-        int result = send(clientSocket, encryptedData.c_str(), encryptedData.size(), 0);
-        if (result == SOCKET_ERROR)
+
+        unsigned char iv[16];
+        auto encryptedData = aesEncrypt(telemetryData, iv);
+        // Send IV first
+        int sent = send(clientSocket, (char*)iv, 16, 0);
+        if (sent <= 0)
+        {
+            cerr << "Telemetry socket closed, stopping telemetry" << endl;
+            break;
+        }
+        // Send encrypted telemetry
+        if (send(clientSocket,
+                (char*)encryptedData.data(),
+                encryptedData.size(),
+                0) == SOCKET_ERROR)
         {
             cerr << "Send failed: " << WSAGetLastError() << endl;
             break;
         }
 
-        cout << "Sent Telemetry Data: " << telemetryData << endl;
+        cout << "Sent Telemetry Data (AES): " << telemetryData << endl;
         this_thread::sleep_for(chrono::seconds(5));
+
     }
     
     closesocket(clientSocket);
@@ -379,7 +481,9 @@ void sendTelemetryData()
 }
 
 int main(int argc, char *argv[])
-{
+{   
+    signal(SIGINT, handleSignal);
+
     if (argc < 3)
     {
         cerr << "Usage: " << argv[0] << " <drone_name> <drone_port>" << endl;
@@ -403,6 +507,7 @@ int main(int argc, char *argv[])
     controlCommandThread.join();
     telemetryThread.join();
     updatePositionThread.join();
+    cout << "drone shut down gracefully." << endl;
 
     return 0;
 }
