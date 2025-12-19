@@ -84,9 +84,9 @@ How to Run
 
 2. Start drones (each in its own terminal or background process):
 
-   ./drone alpha 5000 > alpha.log 2>&1
-   ./drone beta  5001 > beta.log  2>&1
-   ./drone gamma 5002 > gamma.log 2>&1
+   - ./drone alpha 5000 > alpha.log 2>&1
+   - ./drone beta  5001 > beta.log  2>&1
+   - ./drone gamma 5002 > gamma.log 2>&1
 
 3. Use the server console to:
    - View connected drones
