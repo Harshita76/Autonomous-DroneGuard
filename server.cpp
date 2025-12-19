@@ -7,7 +7,12 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
-
+#include <limits>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <vector>
+#include <csignal>
+#include <atomic>
 
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -20,6 +25,7 @@
 #include <map>
 #include <utility>
 #include <sstream>
+#include <mutex>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -30,19 +36,80 @@ using namespace std;
 #define FILE_TRANSFER_PORT 8082
 #define BUFFER_SIZE 1024
 
+const unsigned char AES_KEY_128[16] = {
+    'D','R','O','N','E','G','U','A','R','D','1','2','3','4','5','6'
+};
+
+atomic<bool> running(true);
+mutex mp_mutex;
 map<string, pair<string, int>> mp;
 
-string xorEncryptDecrypt(const string &message, char key)
+
+void handleSignal(int)
 {
-    string result = message;
-    for (int i = 0; i < message.size(); i++)
-    {
-        result[i] = message[i] ^ key;
-    }
-    return result;
+    running = false;
 }
 
-// Function to handle control commands (UDP)
+
+//AES Encryption and Decryption functions
+vector<unsigned char> aesEncrypt(
+    const string &plaintext,
+    unsigned char *iv_out
+) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    RAND_bytes(iv_out, 16);
+
+    vector<unsigned char> ciphertext(plaintext.size() + 16);
+    int len, ciphertext_len;
+
+    EVP_EncryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, AES_KEY_128, iv_out);
+    EVP_EncryptUpdate(ctx, ciphertext.data(), &len,
+                      (unsigned char*)plaintext.data(), plaintext.size());
+    ciphertext_len = len;
+
+    EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len);
+    ciphertext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+    ciphertext.resize(ciphertext_len);
+    return ciphertext;
+}
+
+string aesDecrypt(
+    const unsigned char *ciphertext,
+    int ciphertext_len,
+    const unsigned char *iv
+) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    vector<unsigned char> plaintext(ciphertext_len);
+    int len, plaintext_len;
+
+    EVP_DecryptInit_ex(ctx, EVP_aes_128_cbc(), NULL, AES_KEY_128, iv);
+    EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext, ciphertext_len);
+    plaintext_len = len;
+
+    EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len);
+    plaintext_len += len;
+
+    EVP_CIPHER_CTX_free(ctx);
+    return string((char*)plaintext.data(), plaintext_len);
+}
+
+void showConnectedDrones()
+{
+    cout << "\nConnected Drones:\n";
+
+    lock_guard<mutex> lock(mp_mutex);
+    for (auto &d : mp)
+    {
+        cout << "- " << d.first
+             << " (" << d.second.first
+             << ":" << d.second.second << ")\n";
+    }
+
+    cout << endl;
+}
+
 void handleControlCommands()
 {
     WSADATA wsaData;
@@ -52,7 +119,6 @@ void handleControlCommands()
         return;
     }
 
-    // Create a UDP socket
     SOCKET udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udpSocket == INVALID_SOCKET)
     {
@@ -61,13 +127,12 @@ void handleControlCommands()
         return;
     }
 
-    struct sockaddr_in serverAddr;
+    sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port = htons(CONTROL_COMMAND_PORT);
     serverAddr.sin_addr.s_addr = INADDR_ANY;
 
-    // Bind the socket
-    if (bind(udpSocket, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
+    if (bind(udpSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
     {
         cerr << "Bind failed: " << WSAGetLastError() << endl;
         closesocket(udpSocket);
@@ -75,112 +140,154 @@ void handleControlCommands()
         return;
     }
 
-    cout << "Control Commands server listening on port " << CONTROL_COMMAND_PORT << endl;
+    cout << "Control Commands server listening on port "
+         << CONTROL_COMMAND_PORT << endl;
 
-    while (1)
+    while (running)
     {
+        showConnectedDrones();
+
         string drone_name;
         cout << "Enter drone name: ";
         cin >> drone_name;
-        cout << drone_name << endl;
-        
+
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+
         char control_command[1000];
+        cout << "\nAvailable Commands:\n";
+        cout << "1. update <speed>\n";
+        cout << "2. send pic\n";
         cout << "Enter command: ";
-        cin.ignore(); // Clear the input buffer
-        cin.getline(control_command, 1000);
-        
-        if (mp.find(drone_name) == mp.end())
+        cin.getline(control_command, sizeof(control_command));
+
+        pair<string,int> droneInfo;
         {
-            cout << "INVALID DRONE_NAME" << endl;
-            continue;
+            lock_guard<mutex> lock(mp_mutex);
+            auto it = mp.find(drone_name);
+            if (it == mp.end())
+            {
+                cout << "INVALID DRONE_NAME" << endl;
+                continue;
+            }
+            droneInfo = it->second;
         }
-        
+
         string cc = control_command;
         if (cc.find("update") != string::npos)
         {
-            string valueStr = cc.substr(7); // Extract substring after "update "
             try
             {
-                int newSpeed = stoi(valueStr);
-                cout << "Updating speed to: " << newSpeed << endl;
+                stoi(cc.substr(7));
             }
-            catch (invalid_argument &e)
+            catch (...)
             {
-                cout << "INVALID COMMAND - invalid speed value" << endl;
+                cout << "INVALID COMMAND" << endl;
                 continue;
             }
         }
-        else if(cc == "send pic")
-        {
-            cout << "Requesting file transfer from drone" << endl;
-        }
-        else
+        else if (cc != "send pic")
         {
             cout << "INVALID COMMAND" << endl;
             continue;
         }
-        
-        cout << "Sending Control Command to: " << drone_name << ' ' << mp[drone_name].second << ' ' << mp[drone_name].first << endl;
-        
-        sockaddr_in clientAddr;
-        clientAddr.sin_family = AF_INET;
-        clientAddr.sin_port = htons(mp[drone_name].second);
-        inet_pton(AF_INET, (mp[drone_name].first).c_str(), &clientAddr.sin_addr);
-        
-        string encryptedCommand = xorEncryptDecrypt(control_command, 'K');
 
-        if (sendto(udpSocket, encryptedCommand.c_str(), encryptedCommand.length(), 0,
-                   (struct sockaddr *)&clientAddr, sizeof(clientAddr)) == SOCKET_ERROR)
+        sockaddr_in clientAddr{};
+        clientAddr.sin_family = AF_INET;
+        clientAddr.sin_port = htons(droneInfo.second);
+        inet_pton(AF_INET, droneInfo.first.c_str(), &clientAddr.sin_addr);
+
+        time_t now = time(nullptr);
+        string payload = to_string(now) + "|" + cc;
+
+        unsigned char iv[16];
+        auto encrypted = aesEncrypt(payload, iv);
+
+        if (sendto(udpSocket, (char*)iv, 16, 0,
+                   (sockaddr*)&clientAddr, sizeof(clientAddr)) <= 0)
         {
-            cerr << "Send failed: " << WSAGetLastError() << endl;
+            cerr << "Failed to send IV" << endl;
+            continue;
+        }
+
+        if (sendto(udpSocket, (char*)encrypted.data(), encrypted.size(), 0,
+                   (sockaddr*)&clientAddr, sizeof(clientAddr)) <= 0)
+        {
+            cerr << "Failed to send encrypted command" << endl;
         }
         else
         {
-            cout << "Control command sent successfully" << endl;
+            cout << "Control command sent successfully (AES)"
+                 << endl;
         }
     }
 
     closesocket(udpSocket);
     WSACleanup();
 }
-
 void connectClient(SOCKET new_socket, string clientIP, int clientPort)
 {
-    char buffer[BUFFER_SIZE] = {0};
-    int valread;
+    char buffer[BUFFER_SIZE];
     string drone_name;
-    
-    while ((valread = recv(new_socket, buffer, BUFFER_SIZE, 0)) > 0)
+
+    ofstream log("telemetry.log", ios::app);
+
+    while (running)
     {
-        // Decrypt telemetry data
-        string encryptedTelemetry(buffer, valread);
-        string telemetry = xorEncryptDecrypt(encryptedTelemetry, 'K');
-        cout << "Received Telemetry: " << telemetry << endl;
-        
-        if(telemetry[0] == '1')
+        unsigned char iv[16];
+        if (recv(new_socket, (char*)iv, 16, 0) != 16)
+            break;
+
+        int n = recv(new_socket, buffer, BUFFER_SIZE, 0);
+        if (n <= 0)
+            break;
+
+        string telemetry = aesDecrypt((unsigned char*)buffer, n, iv);
+
+        // Handle REGISTER
+        if (telemetry.find("REGISTER") == 0)
         {
-            drone_name = telemetry.substr(2);
-            mp[drone_name] = {clientIP, clientPort};
-            cout << "Connected To Drone: " << drone_name << ' ' << clientIP << ' ' << clientPort << endl;
-            memset(buffer, 0, BUFFER_SIZE);
+            istringstream iss(telemetry);
+            string tag;
+            int controlPort;
+
+            iss >> tag >> drone_name >> controlPort;
+
+            {
+                lock_guard<mutex> lock(mp_mutex);
+                mp[drone_name] = {clientIP, controlPort};
+            }
+
+            cout << "Connected To Drone: "
+                 << drone_name << " "
+                 << clientIP << " "
+                 << controlPort << endl;
+
             continue;
         }
-        
+
+        // Handle telemetry data
         istringstream iss(telemetry);
-        string data1, data2;
-        string x, y;
+        string l1, l2, v1, v2;
+        iss >> l1 >> v1 >> l2 >> v2;
 
-        // Extract components from the string
-        iss >> data1 >> x >> data2 >> y;
-        cout << "Telemetry data received from " << drone_name << ": " << data1 << ": " << x << ' ' << data2 << ": " << y << endl;
-
-        memset(buffer, 0, BUFFER_SIZE);
+        log << drone_name << " "
+            << l1 << ": " << v1 << " "
+            << l2 << ": " << v2 << endl;
     }
 
-    mp.erase(drone_name);
+    // Graceful disconnect cleanup
+    if (!drone_name.empty())
+    {
+        lock_guard<mutex> lock(mp_mutex);
+        mp.erase(drone_name);
+    }
+
     cout << "Connection closed by client: " << drone_name << endl;
+
+    log.close();
     closesocket(new_socket);
 }
+
 
 // Function to handle telemetry data (TCP)
 void handleTelemetry()
@@ -229,7 +336,7 @@ void handleTelemetry()
     
     cout << "Telemetry server listening on port " << TELEMETRY_PORT << endl;
     
-    while (true)
+    while (running)
     {
         struct sockaddr_in client_address;
         int client_addrlen = sizeof(client_address);
@@ -258,43 +365,52 @@ void handleTelemetry()
 
 void fileReceive(SOCKET new_socket, string clientIP, int clientPort)
 {
-    char buffer[BUFFER_SIZE] = {0};
-    string filename = "";
+    char buffer[BUFFER_SIZE];
+    string filename;
 
     cout << "File transfer from: " << clientIP << ':' << clientPort << endl;
-    
-    for(auto x : mp)
+
     {
-        if(((x.second).first == clientIP))
+        lock_guard<mutex> lock(mp_mutex);
+        for (auto &x : mp)
         {
-            filename = x.first + ".txt";
-            break;
+            if (x.second.first == clientIP)
+            {
+                filename = x.first + ".txt";
+                break;
+            }
         }
     }
 
-    if(filename == "")
+    if (filename.empty())
     {
         cout << "Drone sending file is not Active" << endl;
         closesocket(new_socket);
         return;
     }
-    
+
     cout << "Receiving file: " << filename << endl;
     ofstream file(filename, ios::out | ios::binary);
 
-    // Read file in chunks
-    int valread;
-    while ((valread = recv(new_socket, buffer, BUFFER_SIZE, 0)) > 0) 
+    while (running)
     {
-        string encryptedChunk(buffer, valread);
-        string chunk = xorEncryptDecrypt(encryptedChunk, 'K');
-        file.write(chunk.c_str(), chunk.size());
+        unsigned char iv[16];
+        if (recv(new_socket, (char*)iv, 16, 0) != 16)
+            break;
+
+        int n = recv(new_socket, buffer, BUFFER_SIZE, 0);
+        if (n <= 0)
+            break;
+
+        string chunk = aesDecrypt((unsigned char*)buffer, n, iv);
+        file.write(chunk.data(), chunk.size());
     }
 
     file.close();
     cout << "File received successfully: " << filename << endl;
     closesocket(new_socket);
 }
+
 
 // Function to handle file transfers (TCP)
 void handleFileTransfer() 
@@ -343,7 +459,7 @@ void handleFileTransfer()
 
     cout << "File Transfer server listening on port " << FILE_TRANSFER_PORT << endl;
 
-    while (true) 
+    while (running) 
     {
         struct sockaddr_in client_address;
         int client_addrlen = sizeof(client_address);
@@ -370,6 +486,7 @@ void handleFileTransfer()
 
 int main()
 {
+    signal(SIGINT, handleSignal);
     cout << "Starting Drone Control Server..." << endl;
     
     // Start threads for each mode of communication
